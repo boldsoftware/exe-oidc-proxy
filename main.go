@@ -131,6 +131,7 @@ func handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	redirectURI := r.URL.Query().Get("redirect_uri")
 	state := r.URL.Query().Get("state")
 	nonce := r.URL.Query().Get("nonce")
+	responseMode := r.URL.Query().Get("response_mode")
 
 	if redirectURI == "" {
 		http.Error(w, "missing redirect_uri", http.StatusBadRequest)
@@ -145,12 +146,20 @@ func handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 		return
 	}
-	q := u.Query()
-	q.Set("code", code)
+
+	// Build the response parameters
+	params := url.Values{}
+	params.Set("code", code)
 	if state != "" {
-		q.Set("state", state)
+		params.Set("state", state)
 	}
-	u.RawQuery = q.Encode()
+
+	// Use fragment or query based on response_mode
+	if responseMode == "fragment" {
+		u.Fragment = params.Encode()
+	} else {
+		u.RawQuery = params.Encode()
+	}
 	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
@@ -181,17 +190,27 @@ func handleToken(w http.ResponseWriter, r *http.Request) {
 
 	accessToken := randomString(32)
 	tokens.Store(accessToken, tokenInfo{Email: ac.Email, UserID: ac.UserID}, 24*time.Hour)
+	log.Printf("token: issued access_token=%q for %s", accessToken, ac.Email)
+
+	// Derive a display name from email
+	name := ac.Email
+	if idx := strings.Index(ac.Email, "@"); idx > 0 {
+		name = ac.Email[:idx]
+	}
 
 	now := time.Now()
 	idToken := jwtToken{
 		Header: jwtHeader{Alg: "ES256", Typ: "JWT", Kid: keyID},
 		Claims: map[string]any{
-			"iss":   cfg.Issuer,
-			"sub":   ac.UserID,
-			"aud":   cfg.ClientID,
-			"email": ac.Email,
-			"iat":   now.Unix(),
-			"exp":   now.Add(24 * time.Hour).Unix(),
+			"iss":                cfg.Issuer,
+			"sub":                ac.UserID,
+			"aud":                cfg.ClientID,
+			"email":              ac.Email,
+			"name":               name,
+			"preferred_username": name,
+			"groups":             []string{"admin"},
+			"iat":                now.Unix(),
+			"exp":                now.Add(24 * time.Hour).Unix(),
 		},
 	}
 	if ac.Nonce != "" {
@@ -215,22 +234,50 @@ func handleToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUserInfo(w http.ResponseWriter, r *http.Request) {
+	// Log all headers for debugging
+	log.Printf("userinfo: method=%s", r.Method)
+	for name, values := range r.Header {
+		log.Printf("userinfo: header %s=%v", name, values)
+	}
+	log.Printf("userinfo: query=%s", r.URL.RawQuery)
+
 	accessToken := extractBearerToken(r)
+	// Also check query parameter and form body (some clients send it there)
 	if accessToken == "" {
+		accessToken = r.URL.Query().Get("access_token")
+	}
+	if accessToken == "" {
+		r.ParseForm()
+		accessToken = r.FormValue("access_token")
+	}
+	log.Printf("userinfo: token=%q", accessToken)
+	if accessToken == "" {
+		log.Printf("userinfo: no bearer token in header, query, or form")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	info, ok := tokens.Load(accessToken)
 	if !ok {
+		log.Printf("userinfo: token not found in store")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
+	}
+	log.Printf("userinfo: found user %s", info.Email)
+
+	// Derive a display name from email (part before @)
+	name := info.Email
+	if idx := strings.Index(info.Email, "@"); idx > 0 {
+		name = info.Email[:idx]
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"sub":   info.UserID,
-		"email": info.Email,
+		"sub":                info.UserID,
+		"email":              info.Email,
+		"name":               name,
+		"preferred_username": name,
+		"groups":             []string{"admin"},
 	})
 }
 
@@ -265,7 +312,8 @@ func authenticateClient(r *http.Request) bool {
 
 func extractBearerToken(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(auth, "Bearer ") {
+	// Handle both "Bearer" and "bearer" (case-insensitive)
+	if len(auth) > 7 && strings.EqualFold(auth[:6], "bearer") && auth[6] == ' ' {
 		return auth[7:]
 	}
 	return ""

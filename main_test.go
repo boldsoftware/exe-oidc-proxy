@@ -228,7 +228,7 @@ func TestFullOIDCFlow(t *testing.T) {
 	}
 	defer uiResp.Body.Close()
 
-	var userInfo map[string]string
+	var userInfo map[string]any
 	if err := json.NewDecoder(uiResp.Body).Decode(&userInfo); err != nil {
 		t.Fatal(err)
 	}
@@ -237,6 +237,10 @@ func TestFullOIDCFlow(t *testing.T) {
 	}
 	if userInfo["sub"] != "usr_bob" {
 		t.Errorf("userinfo sub = %q", userInfo["sub"])
+	}
+	groups, ok := userInfo["groups"].([]any)
+	if !ok || len(groups) != 1 || groups[0] != "admin" {
+		t.Errorf("userinfo groups = %v", userInfo["groups"])
 	}
 }
 
