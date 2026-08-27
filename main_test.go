@@ -31,6 +31,9 @@ func setupTest(t *testing.T, upstream *httptest.Server) *http.ServeMux {
 		Issuer:       "https://test.exe.xyz/_oidc",
 		ClientID:     "testapp",
 		ClientSecret: "testsecret",
+		// The tests drive the app from a host other than the issuer's, so
+		// the callbacks have to be registered explicitly.
+		RedirectURIs: []string{"http://app/callback", "http://app/cb"},
 	}
 
 	// Clear state.
@@ -515,5 +518,261 @@ func verifyIDToken(t *testing.T, tokenStr, wantEmail, wantSub, wantNonce string)
 	}
 	if claims["aud"] != cfg.ClientID {
 		t.Errorf("aud = %v, want %v", claims["aud"], cfg.ClientID)
+	}
+}
+
+func TestAuthorizeRejectsUnregisteredRedirectURI(t *testing.T) {
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	defer upstream.Close()
+	mux := setupTest(t, upstream)
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	noFollow := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	for _, redirectURI := range []string{
+		"https://evil.example/steal",
+		"http://app.evil.example/callback",
+		"http://app/callback/../../elsewhere",
+		"//evil.example/steal",
+		"javascript:alert(1)",
+		"http://app/callback#frag",
+	} {
+		req, _ := http.NewRequest("GET", srv.URL+"/_oidc/authorize?state=s&redirect_uri="+url.QueryEscape(redirectURI), nil)
+		req.Header.Set("X-Exedev-Email", "victim@test.com")
+		req.Header.Set("X-Exedev-Userid", "usr_victim")
+
+		resp, err := noFollow.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("redirect_uri %q: status = %d, want 400 (Location %q)", redirectURI, resp.StatusCode, resp.Header.Get("Location"))
+		}
+		if loc := resp.Header.Get("Location"); loc != "" {
+			t.Errorf("redirect_uri %q: redirected to %q, want no redirect", redirectURI, loc)
+		}
+	}
+}
+
+func TestAuthorizeDefaultsToIssuerOrigin(t *testing.T) {
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	defer upstream.Close()
+	mux := setupTest(t, upstream)
+	cfg.RedirectURIs = nil // no explicit registration: fall back to the issuer's origin
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	noFollow := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	tests := []struct {
+		redirectURI string
+		wantStatus  int
+	}{
+		{"https://test.exe.xyz/auth/callback", http.StatusFound},
+		{"https://test.exe.xyz:443/auth/callback", http.StatusFound},       // default port, same origin
+		{"https://TEST.exe.xyz/auth/callback", http.StatusFound},           // host comparison is case-insensitive
+		{"https://test.exe.xyz:8443/auth/callback", http.StatusBadRequest}, // non-default port is a different origin
+		{"http://test.exe.xyz/auth/callback", http.StatusBadRequest},       // scheme downgrade
+		{"https://test.exe.xyz.evil.example/cb", http.StatusBadRequest},    // suffix trick
+		{"https://evil.example/steal", http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		req, _ := http.NewRequest("GET", srv.URL+"/_oidc/authorize?state=s&redirect_uri="+url.QueryEscape(tt.redirectURI), nil)
+		req.Header.Set("X-Exedev-Email", "victim@test.com")
+		req.Header.Set("X-Exedev-Userid", "usr_victim")
+
+		resp, err := noFollow.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != tt.wantStatus {
+			t.Errorf("redirect_uri %q: status = %d, want %d", tt.redirectURI, resp.StatusCode, tt.wantStatus)
+		}
+	}
+}
+
+func TestAuthorizeKeepsRedirectURIQuery(t *testing.T) {
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	defer upstream.Close()
+	mux := setupTest(t, upstream)
+	cfg.RedirectURIs = []string{"http://app/cb?tenant=foo"}
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	noFollow := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	req, _ := http.NewRequest("GET", srv.URL+"/_oidc/authorize?state=s&redirect_uri="+url.QueryEscape("http://app/cb?tenant=foo"), nil)
+	req.Header.Set("X-Exedev-Email", "frank@test.com")
+	req.Header.Set("X-Exedev-Userid", "usr_frank")
+
+	resp, err := noFollow.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("status = %d, want 302", resp.StatusCode)
+	}
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loc.Query().Get("tenant"); got != "foo" {
+		t.Errorf("tenant = %q, want foo (Location %q)", got, loc)
+	}
+	if loc.Query().Get("code") == "" {
+		t.Error("missing code")
+	}
+	if got := loc.Query().Get("state"); got != "s" {
+		t.Errorf("state = %q, want s", got)
+	}
+}
+
+func TestAuthorizeFragmentResponseMode(t *testing.T) {
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	defer upstream.Close()
+	mux := setupTest(t, upstream)
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	noFollow := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	// The state contains characters that url.Values.Encode escapes; they
+	// must arrive encoded exactly once.
+	state := "a/b:c"
+	req, _ := http.NewRequest("GET", srv.URL+"/_oidc/authorize?response_mode=fragment&state="+url.QueryEscape(state)+"&redirect_uri="+url.QueryEscape("http://app/callback"), nil)
+	req.Header.Set("X-Exedev-Email", "grace@test.com")
+	req.Header.Set("X-Exedev-Userid", "usr_grace")
+
+	resp, err := noFollow.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("status = %d, want 302", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	before, frag, ok := strings.Cut(loc, "#")
+	if !ok {
+		t.Fatalf("Location %q has no fragment", loc)
+	}
+	params, err := url.ParseQuery(frag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := params.Get("state"); got != state {
+		t.Errorf("fragment state = %q, want %q (Location %q)", got, state, loc)
+	}
+	if params.Get("code") == "" {
+		t.Error("missing code in fragment")
+	}
+	if u, err := url.Parse(before); err != nil || u.Query().Get("code") != "" {
+		t.Errorf("code leaked into the query: %q", before)
+	}
+}
+
+func TestTokenRejectsMismatchedRedirectURI(t *testing.T) {
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	defer upstream.Close()
+	mux := setupTest(t, upstream)
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	noFollow := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	req, _ := http.NewRequest("GET", srv.URL+"/_oidc/authorize?redirect_uri=http://app/callback&state=s", nil)
+	req.Header.Set("X-Exedev-Email", "erin@test.com")
+	req.Header.Set("X-Exedev-Userid", "usr_erin")
+	resp, err := noFollow.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	loc, _ := url.Parse(resp.Header.Get("Location"))
+	code := loc.Query().Get("code")
+	if code == "" {
+		t.Fatal("no code in redirect")
+	}
+
+	// The code was issued to /callback; redeeming it against /cb must fail.
+	tokenResp, err := http.PostForm(srv.URL+"/_oidc/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"redirect_uri":  {"http://app/cb"},
+		"client_id":     {cfg.ClientID},
+		"client_secret": {cfg.ClientSecret},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tokenResp.Body.Close()
+
+	if tokenResp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", tokenResp.StatusCode)
+	}
+}
+
+func TestCheckRedirectURIRequiresParsableIssuer(t *testing.T) {
+	saved := cfg
+	t.Cleanup(func() { cfg = saved })
+	cfg = config{Issuer: "not-a-url"}
+	if _, err := checkRedirectURI("https://anything.example/cb"); err == nil {
+		t.Error("checkRedirectURI succeeded with an unparsable issuer, want error")
+	}
+}
+
+func TestCheckRedirectURIRejectsUnicodeLookalikeHost(t *testing.T) {
+	saved := cfg
+	t.Cleanup(func() { cfg = saved })
+	cfg = config{Issuer: "https://i.example/_oidc"}
+	// strings.ToLower folds İ (U+0130) to i, but browsers deliver this host
+	// as the distinct origin xn--i-9bb.example, so it must not match the
+	// issuer's origin.
+	if _, err := checkRedirectURI("https://İ.example/cb"); err == nil {
+		t.Error("checkRedirectURI accepted look-alike host İ.example, want error")
+	}
+}
+
+func TestCredsMatch(t *testing.T) {
+	saved := cfg
+	t.Cleanup(func() { cfg = saved })
+	cfg = config{ClientID: "testapp", ClientSecret: "testsecret"}
+
+	if !credsMatch("testapp", "testsecret") {
+		t.Error("correct credentials rejected")
+	}
+	for _, tt := range []struct{ id, secret string }{
+		{"testapp", "wrong"},
+		{"wrong", "testsecret"},
+		{"testapp", ""},
+		{"", ""},
+		{"testapp", "testsecret2"},
+	} {
+		if credsMatch(tt.id, tt.secret) {
+			t.Errorf("credsMatch(%q, %q) = true, want false", tt.id, tt.secret)
+		}
 	}
 }

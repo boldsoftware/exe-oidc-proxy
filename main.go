@@ -5,10 +5,13 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -34,12 +37,20 @@ type config struct {
 	Issuer       string
 	ClientID     string
 	ClientSecret string
+
+	// RedirectURIs is the set of redirection endpoints the client is
+	// registered to use, matched exactly (RFC 6749 §3.1.2.2). When empty,
+	// any redirect URI on the issuer's own origin is accepted, which covers
+	// the common case: this proxy fronts a single app served from the same
+	// hostname it issues tokens for.
+	RedirectURIs []string
 }
 
 type authCode struct {
-	Email  string
-	UserID string
-	Nonce  string
+	Email       string
+	UserID      string
+	Nonce       string
+	RedirectURI string
 }
 
 type tokenInfo struct {
@@ -53,7 +64,14 @@ func main() {
 	flag.StringVar(&cfg.Issuer, "issuer", os.Getenv("ISSUER"), "OIDC issuer URL")
 	flag.StringVar(&cfg.ClientID, "client-id", os.Getenv("CLIENT_ID"), "OIDC client ID")
 	flag.StringVar(&cfg.ClientSecret, "client-secret", os.Getenv("CLIENT_SECRET"), "OIDC client secret")
+	redirectURIs := flag.String("redirect-uri", os.Getenv("REDIRECT_URI"), "comma-separated list of registered redirect URIs (default: any URI on the issuer's origin)")
 	flag.Parse()
+
+	for _, u := range strings.Split(*redirectURIs, ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.RedirectURIs = append(cfg.RedirectURIs, u)
+		}
+	}
 
 	if cfg.Upstream == "" {
 		log.Fatal("--upstream is required")
@@ -68,7 +86,28 @@ func main() {
 		log.Fatal("--client-secret is required")
 	}
 
-	var err error
+	// checkRedirectURI falls back to the issuer's origin, so an issuer that
+	// doesn't parse would silently reject every authorization request.
+	origin, err := issuerOrigin()
+	if err != nil {
+		log.Fatalf("parsing issuer URL: %v", err)
+	}
+
+	// A registered redirect URI that can't pass checkRedirectURI's syntactic
+	// gates can never match, so it would silently reject every authorization
+	// request that names it.
+	for _, u := range cfg.RedirectURIs {
+		if _, err := checkRedirectURI(u); err != nil {
+			log.Fatalf("registered redirect URI %q: %v", u, err)
+		}
+	}
+
+	if len(cfg.RedirectURIs) > 0 {
+		log.Printf("redirect URIs: %s", strings.Join(cfg.RedirectURIs, ", "))
+	} else {
+		log.Printf("redirect URIs: any on %s", originOf(origin))
+	}
+
 	signingKey, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		log.Fatalf("generating signing key: %v", err)
@@ -100,17 +139,17 @@ func main() {
 func handleDiscovery(w http.ResponseWriter, r *http.Request) {
 	doc := map[string]any{
 		"issuer":                                cfg.Issuer,
-		"authorization_endpoint":                 cfg.Issuer + "/authorize",
-		"token_endpoint":                         cfg.Issuer + "/token",
-		"userinfo_endpoint":                      cfg.Issuer + "/userinfo",
-		"jwks_uri":                               cfg.Issuer + "/jwks",
-		"response_types_supported":               []string{"code"},
-		"subject_types_supported":                []string{"public"},
-		"id_token_signing_alg_values_supported":  []string{"ES256"},
-		"scopes_supported":                       []string{"openid", "email", "profile"},
-		"token_endpoint_auth_methods_supported":  []string{"client_secret_post", "client_secret_basic"},
-		"claims_supported":                       []string{"sub", "email", "iss", "aud", "exp", "iat", "nonce"},
-		"grant_types_supported":                  []string{"authorization_code"},
+		"authorization_endpoint":                cfg.Issuer + "/authorize",
+		"token_endpoint":                        cfg.Issuer + "/token",
+		"userinfo_endpoint":                     cfg.Issuer + "/userinfo",
+		"jwks_uri":                              cfg.Issuer + "/jwks",
+		"response_types_supported":              []string{"code"},
+		"subject_types_supported":               []string{"public"},
+		"id_token_signing_alg_values_supported": []string{"ES256"},
+		"scopes_supported":                      []string{"openid", "email", "profile"},
+		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
+		"claims_supported":                      []string{"sub", "email", "iss", "aud", "exp", "iat", "nonce"},
+		"grant_types_supported":                 []string{"authorization_code"},
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(doc)
@@ -138,29 +177,119 @@ func handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code := randomString(32)
-	codes.Store(code, authCode{Email: email, UserID: userID, Nonce: nonce}, 60*time.Second)
-
-	u, err := url.Parse(redirectURI)
+	// An unregistered redirect URI is reported to the user agent, never
+	// redirected to (RFC 6749 §4.1.2.1): redirecting would hand the
+	// authorization code to whoever supplied the URI.
+	u, err := checkRedirectURI(redirectURI)
 	if err != nil {
+		log.Printf("authorize: rejecting redirect_uri %q for %s: %v", redirectURI, email, err)
 		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 		return
 	}
 
-	// Build the response parameters
+	code := randomString(32)
+	codes.Store(code, authCode{Email: email, UserID: userID, Nonce: nonce, RedirectURI: redirectURI}, 60*time.Second)
+
+	// Build the response parameters. A query component already present on
+	// the redirect URI is retained (RFC 6749 §3.1.2): in query mode the
+	// response parameters merge into it, in fragment mode it rides along
+	// untouched.
 	params := url.Values{}
+	if responseMode != "fragment" {
+		params = u.Query()
+	}
 	params.Set("code", code)
 	if state != "" {
 		params.Set("state", state)
 	}
 
-	// Use fragment or query based on response_mode
 	if responseMode == "fragment" {
-		u.Fragment = params.Encode()
-	} else {
-		u.RawQuery = params.Encode()
+		// u.String() re-escapes u.Fragment, which would double-encode the
+		// already-encoded parameters; append the fragment directly instead.
+		http.Redirect(w, r, u.String()+"#"+params.Encode(), http.StatusFound)
+		return
 	}
+	u.RawQuery = params.Encode()
 	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+// issuerOrigin returns the scheme and host of the configured issuer, which is
+// the default origin that redirect URIs must belong to.
+func issuerOrigin() (*url.URL, error) {
+	u, err := url.Parse(cfg.Issuer)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("issuer %q is not an absolute URL", cfg.Issuer)
+	}
+	return u, nil
+}
+
+// checkRedirectURI parses raw and reports whether the client is registered to
+// use it. With -redirect-uri set, raw must match one of the registered values
+// exactly; otherwise it must sit on the issuer's own origin.
+func checkRedirectURI(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("unparsable: %w", err)
+	}
+	// RFC 6749 §3.1.2: the redirection endpoint must be an absolute URI and
+	// must not carry a fragment (the server owns the fragment in the
+	// response_mode=fragment case).
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("scheme %q is not http or https", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("not an absolute URI")
+	}
+	if u.Fragment != "" || u.RawFragment != "" {
+		return nil, fmt.Errorf("carries a fragment")
+	}
+
+	if len(cfg.RedirectURIs) > 0 {
+		for _, want := range cfg.RedirectURIs {
+			if raw == want {
+				return u, nil
+			}
+		}
+		return nil, fmt.Errorf("not a registered redirect URI")
+	}
+
+	origin, err := issuerOrigin()
+	if err != nil {
+		return nil, err
+	}
+	if got, want := originOf(u), originOf(origin); got != want {
+		return nil, fmt.Errorf("origin %s is not the issuer's origin %s", got, want)
+	}
+	return u, nil
+}
+
+// originOf renders u's scheme and authority in a comparable form: lowercased,
+// with the scheme's default port dropped, so that https://host and
+// https://host:443 compare equal. Folding is ASCII-only: Unicode look-alike
+// hosts (İ.example) reach browsers as distinct punycode origins, so they must
+// not compare equal here.
+func originOf(u *url.URL) string {
+	scheme := lowerASCII(u.Scheme)
+	host := lowerASCII(u.Host)
+	if h, port, err := net.SplitHostPort(host); err == nil {
+		if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+			host = h
+		}
+	}
+	return scheme + "://" + host
+}
+
+// lowerASCII lowercases ASCII letters only, leaving other runes untouched.
+func lowerASCII(s string) string {
+	return strings.Map(func(r rune) rune {
+		if 'A' <= r && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, s)
 }
 
 func handleToken(w http.ResponseWriter, r *http.Request) {
@@ -188,9 +317,19 @@ func handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// RFC 6749 §10.6: the redirect URI presented here must be the one the
+	// code was issued to. Clients that omit it are tolerated for
+	// compatibility -- client authentication above is the real gate, and
+	// the code only ever reached a URI that passed checkRedirectURI.
+	if got := r.FormValue("redirect_uri"); got != "" && got != ac.RedirectURI {
+		log.Printf("token: redirect_uri %q does not match the one the code was issued to", got)
+		http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+		return
+	}
+
 	accessToken := randomString(32)
 	tokens.Store(accessToken, tokenInfo{Email: ac.Email, UserID: ac.UserID}, 24*time.Hour)
-	log.Printf("token: issued access_token=%q for %s", accessToken, ac.Email)
+	log.Printf("token: issued access token for %s", ac.Email)
 
 	// Derive a display name from email
 	name := ac.Email
@@ -234,13 +373,6 @@ func handleToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUserInfo(w http.ResponseWriter, r *http.Request) {
-	// Log all headers for debugging
-	log.Printf("userinfo: method=%s", r.Method)
-	for name, values := range r.Header {
-		log.Printf("userinfo: header %s=%v", name, values)
-	}
-	log.Printf("userinfo: query=%s", r.URL.RawQuery)
-
 	accessToken := extractBearerToken(r)
 	// Also check query parameter and form body (some clients send it there)
 	if accessToken == "" {
@@ -250,20 +382,18 @@ func handleUserInfo(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
 		accessToken = r.FormValue("access_token")
 	}
-	log.Printf("userinfo: token=%q", accessToken)
 	if accessToken == "" {
-		log.Printf("userinfo: no bearer token in header, query, or form")
+		log.Printf("userinfo: no access token in header, query, or form")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	info, ok := tokens.Load(accessToken)
 	if !ok {
-		log.Printf("userinfo: token not found in store")
+		log.Printf("userinfo: unknown access token")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	log.Printf("userinfo: found user %s", info.Email)
 
 	// Derive a display name from email (part before @)
 	name := info.Email
@@ -299,15 +429,32 @@ func handleJWKS(w http.ResponseWriter, r *http.Request) {
 
 // authenticateClient checks client credentials from POST body or Basic auth.
 func authenticateClient(r *http.Request) bool {
-	// Try POST body first.
-	if r.FormValue("client_id") == cfg.ClientID && r.FormValue("client_secret") == cfg.ClientSecret {
+	// Try POST body first. PostFormValue ignores the URL query: a secret
+	// there would land in access logs and intermediaries.
+	if credsMatch(r.PostFormValue("client_id"), r.PostFormValue("client_secret")) {
 		return true
 	}
 	// Try Basic auth.
 	if user, pass, ok := r.BasicAuth(); ok {
-		return user == cfg.ClientID && pass == cfg.ClientSecret
+		return credsMatch(user, pass)
 	}
 	return false
+}
+
+// credsMatch reports whether id and secret are the configured client
+// credentials, without leaking how far they matched through timing.
+func credsMatch(id, secret string) bool {
+	idOK := constantTimeEqual(id, cfg.ClientID)
+	secretOK := constantTimeEqual(secret, cfg.ClientSecret)
+	return idOK && secretOK
+}
+
+// constantTimeEqual compares digests rather than the strings themselves so
+// that the comparison leaks neither content nor length.
+func constantTimeEqual(a, b string) bool {
+	ah := sha256.Sum256([]byte(a))
+	bh := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(ah[:], bh[:]) == 1
 }
 
 func extractBearerToken(r *http.Request) string {

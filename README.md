@@ -44,6 +44,26 @@ All flags can also be set via environment variables:
 | `-issuer` | `ISSUER` | OIDC issuer URL (your VM's public URL + `/_oidc`) |
 | `-client-id` | `CLIENT_ID` | OIDC client ID the app will use |
 | `-client-secret` | `CLIENT_SECRET` | OIDC client secret the app will use |
+| `-redirect-uri` | `REDIRECT_URI` | Comma-separated list of redirect URIs the app is allowed to use |
+
+## Redirect URIs
+
+The authorization endpoint only redirects to a URI the app is registered to
+use. By default that means any URI on the issuer's own origin, which is what
+the architecture above produces: the app is served from the same hostname the
+proxy issues tokens for. If the app's callback lives somewhere else, register
+it explicitly:
+
+```
+exe-oidc-proxy ... -redirect-uri https://myapp.example/auth/callback
+```
+
+Registered URIs are matched exactly, and setting `-redirect-uri` replaces the
+issuer-origin default rather than adding to it: once the list exists, list
+every callback the app uses, including ones on the issuer's own origin.
+
+An unregistered `redirect_uri` gets a 400 and no redirect -- redirecting would
+hand the authorization code to whoever supplied the URI.
 
 ## How it works
 
